@@ -3,7 +3,6 @@ name: Run Medal PACS Bot Directly on GitHub (Free 24/7)
 on:
   workflow_dispatch:
   schedule:
-    # اجرای خودکار هر ۵ ساعت برای چرخه ۲۴ ساعته
     - cron: '0 */5 * * *'
 
 jobs:
@@ -18,7 +17,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install System Dependencies (OpenCV & Fonts)
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-glx fonts-dejavu-core
@@ -33,5 +32,4 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           PORT: 7860
         run: |
-          # اجرای اسکریپت با محدودیت زمانی ۵ ساعت و ۱۵ دقیقه قبل از ری‌استارت بعدی
           timeout 19000s python bot.py || true
