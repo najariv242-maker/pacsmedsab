@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Medal PACS Multi-Hospital Cine Video, DICOM & Smart Search v13.1
 // @namespace    local.pacs.ai
-// @version      14.0.0
+// @version      15.0.0
 // @description  Debugged Stage 1+2: Fixed Auto-Login (doc/doc), Exact Dojo Search Binding (ctl09/ctl10/ctl16/bAllDates), Accurate Persian-to-Finglish Engine, Cross-Hospital Live Search + Untouched v12 Cine Video/DICOM/JPEG Engine
 // @match        *://hh-pacs.medsab.ac.ir/*
 // @match        *://vh-pacs.medsab.ac.ir/*
@@ -62,7 +62,7 @@
         seriesList: [],
         selectedSeriesKey: null,
         outputFormat: "VIDEO", // "VIDEO", "DICOM", or "JPEG"
-        fps: 20, // Customizable FPS: 5, 10, 15, 20, 25, 30, 60
+        fps: 5, // Customizable FPS: 3, 5, 8, 10, 15, 20, 25, 30
         playMode: "PINGPONG", // "FORWARD" or "PINGPONG" (1->N->1 like Rec 0016.mp4)
         includeOverlay: true, // Medical HUD annotations like Rec 0016.mp4
         repeatCount: 1, // Repeat loops for video
@@ -1351,7 +1351,7 @@
                 const scripts = document.getElementsByTagName("script");
                 for (let i = 0; i < scripts.length; i++) {
                     const text = scripts[i].textContent || "";
-                    const m = text.match(/var\s+Studies\s*=\s*(\[\s*\{[\s\S]*?\}\s*\]);/);
+                    const m = text.match(/var\s+Studies\s*=\s*(\[\s*\{[\s\S]*\}\s*\])\s*;/);
                     if (m) {
                         const parsed = (new Function(`return ${m[1]};`))();
                         if (parsed && parsed.length > 0) { study = parsed[0]; break; }
@@ -2058,7 +2058,7 @@
         panel.innerHTML = `
             <div id="pacs-v12-header" style="cursor:move; font-weight:bold; font-size:13px; color:#38bdf8; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
                 <span>🎬 مدال پکس (${window.location.hostname.split(".")[0].toUpperCase()})</span>
-                <span style="font-size:10px; background:#059669; padding:2px 6px; border-radius:4px; color:#fff; font-weight:normal;">v14.0 Final + Auto-Remember</span>
+                <span style="font-size:10px; background:#059669; padding:2px 6px; border-radius:4px; color:#fff; font-weight:normal;">v15.0 Ultra-Fast + 3/5 FPS</span>
             </div>
 
             <!-- Tab Bar -->
@@ -2096,9 +2096,9 @@
                 <div id="pacs-v12-video-opt" style="background:rgba(2, 6, 23, 0.6); padding:8px; border-radius:6px; margin-bottom:8px; border:1px solid rgba(56, 189, 248, 0.2);">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                         <span style="color:#94a3b8; font-size:11px;">سرعت فریم (FPS):</span>
-                        <span id="pacs-v12-fps-val" style="color:#38bdf8; font-family:monospace; font-weight:bold;">20 FPS</span>
+                        <span id="pacs-v12-fps-val" style="color:#38bdf8; font-family:monospace; font-weight:bold;">5 FPS</span>
                     </div>
-                    <input type="range" id="pacs-v12-fps" min="5" max="45" value="20" step="1" style="width:100%; accent-color:#0284c7; margin-bottom:6px; cursor:pointer;">
+                    <input type="range" id="pacs-v12-fps" min="1" max="45" value="5" step="1" style="width:100%; accent-color:#0284c7; margin-bottom:6px; cursor:pointer;">
 
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                         <span style="color:#94a3b8; font-size:11px;">حالت حرکت ویدیو:</span>
