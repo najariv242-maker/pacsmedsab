@@ -56,7 +56,7 @@ PACS_USERNAME = os.environ.get("PACS_USERNAME", "doc").strip()
 PACS_PASSWORD = os.environ.get("PACS_PASSWORD", "doc").strip()
 PACS_PROXY = os.environ.get("PACS_PROXY", "").strip() or None
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-PORT = int(os.environ.get("PORT", "10000"))
+PORT = int(os.environ.get("PORT", "7860"))
 
 PROXIES = {"http": PACS_PROXY, "https": PACS_PROXY} if PACS_PROXY else None
 
@@ -652,7 +652,7 @@ def build_cine_mp4_file(slice_bundles: List[dict], fps: int = 20, play_mode: str
 
 
 # ==============================================================================
-# 5. MULTI-HOSPITAL MEDAL PACS CLIENT (Thread-Safe Requests Sessions)
+# 5. MULTI-HOSPITAL MEDAL PACS CLIENT (Thread-Safe Requests Sessions + Diagnostics)
 # ==============================================================================
 @dataclass
 class PatientRow:
@@ -661,6 +661,7 @@ class PatientRow:
     origin: str
     base_path: str
     row_index: int
+    study_key: str
     pid: str
     name: str
     nid: str
@@ -678,6 +679,16 @@ class PatientRow:
     match_score: float = 1.0
 
 
+@dataclass
+class HospitalSearchResult:
+    hosp_code: str
+    hosp_name: str
+    ok: bool
+    status_msg: str
+    rows: List[PatientRow] = field(default_factory=list)
+    raw_row_count: int = 0
+
+
 class MedalPACSClient:
     def __init__(self):
         self.sessions: Dict[str, requests.Session] = {}
@@ -691,124 +702,292 @@ class MedalPACSClient:
             if PROXIES:
                 s.proxies.update(PROXIES)
             s.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,fa;q=0.8"
             })
             self.sessions[hosp_code] = s
         return self.sessions[hosp_code]
 
-    def resolve_base_path(self, hosp_code: str) -> str:
+    @staticmethod
+    def is_search_page_html(html: str) -> bool:
+        if not html:
+            return False
+        if "Forgot password?" in html or 'type="password"' in html.lower() or "type='password'" in html.lower():
+            return False
+        return (
+            "bSearch" in html
+            or "gMain" in html
+            or "OnSelect" in html
+            or 'name="ctl09"' in html
+            or "bAllDates" in html
+            or "hfSelectedKeys" in html
+        )
+
+    def resolve_base_path(self, hosp_code: str) -> Tuple[str, Optional[str]]:
         if hosp_code in self.resolved_base_paths:
-            return self.resolved_base_paths[hosp_code]
+            return self.resolved_base_paths[hosp_code], None
         hosp = HOSPITALS[hosp_code]
         s = self.get_session(hosp_code)
+        last_err = None
         for path in hosp["candidate_paths"]:
-            url = f"{hosp['origin']}{path}/Login.aspx"
-            try:
-                resp = s.get(url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200 and ("__VIEWSTATE" in resp.text or "MEDAL" in resp.text.upper()):
-                    self.resolved_base_paths[hosp_code] = path
-                    return path
-            except Exception:
-                continue
+            for page in ("Login.aspx", "Default.aspx"):
+                url = f"{hosp['origin']}{path}/{page}"
+                try:
+                    resp = s.get(url, timeout=10, allow_redirects=True)
+                    if resp.status_code == 200 and ("__VIEWSTATE" in resp.text or "MEDAL" in resp.text.upper() or "bSearch" in resp.text):
+                        self.resolved_base_paths[hosp_code] = path
+                        return path, None
+                except requests.exceptions.Timeout:
+                    last_err = "Timeout (عدم دسترسی سرور ابری به شبکه ایران / نیاز به PACS_PROXY یا اجرای لوکال)"
+                except requests.exceptions.ConnectionError as ce:
+                    last_err = f"ConnectionError (سرور بیمارستان از اینترنت خارج مسدود است / نیاز به پروکسی ایران)"
+                except Exception as e:
+                    last_err = str(e)[:80]
         default_p = hosp["candidate_paths"][0]
-        self.resolved_base_paths[hosp_code] = default_p
-        return default_p
+        return default_p, last_err
 
-    def ensure_logged_in(self, hosp_code: str) -> Tuple[Optional[str], str]:
+    def ensure_logged_in(self, hosp_code: str) -> Tuple[Optional[str], str, Optional[str]]:
         with self.locks[hosp_code]:
             hosp = HOSPITALS[hosp_code]
-            base_path = self.resolve_base_path(hosp_code)
+            base_path, resolve_err = self.resolve_base_path(hosp_code)
+            if resolve_err and hosp_code not in self.resolved_base_paths:
+                return None, base_path, resolve_err
+
             s = self.get_session(hosp_code)
             default_url = f"{hosp['origin']}{base_path}/Default.aspx"
+            login_url = f"{hosp['origin']}{base_path}/Login.aspx"
 
             try:
                 resp = s.get(default_url, timeout=12, allow_redirects=True)
-                if "bSearch_imgMain" in resp.text or "gMain" in resp.text:
-                    return resp.text, base_path
+                if self.is_search_page_html(resp.text):
+                    return resp.text, base_path, None
+            except requests.exceptions.Timeout:
+                return None, base_path, "Timeout (آی‌پی سرور شما به سرور بیمارستان دسترسی ندارد)"
+            except requests.exceptions.ConnectionError:
+                return None, base_path, "Connection Refused/Blocked (فایروال دانشگاه علوم پزشکی سبزوار آی‌پی خارج را بسته است)"
             except Exception as e:
                 logger.warning(f"[{hosp_code}] Initial GET Default.aspx failed: {e}")
-                return None, base_path
+                return None, base_path, f"خطای شبکه: {str(e)[:60]}"
 
-            login_url = f"{hosp['origin']}{base_path}/Login.aspx"
             try:
-                lresp = s.get(login_url, timeout=12, allow_redirects=True)
+                lresp = resp if ("__VIEWSTATE" in resp.text and "login" in resp.url.lower()) else s.get(login_url, timeout=12, allow_redirects=True)
                 soup = BeautifulSoup(lresp.text, "lxml")
+
+                form = soup.find("form")
+                post_target_url = login_url
+                if form and form.get("action"):
+                    post_target_url = urllib.parse.urljoin(lresp.url, form.get("action"))
+
                 form_data: Dict[str, str] = {}
                 text_inputs: List[str] = []
                 pass_inputs: List[str] = []
                 submit_btn_name: Optional[str] = None
                 submit_btn_val: str = ""
 
-                for inp in soup.find_all("input"):
+                for inp in soup.find_all(["input", "button"]):
                     name = inp.get("name")
                     if not name:
                         continue
-                    itype = (inp.get("type") or "text").lower()
+                    tag_name = inp.name.lower()
+                    itype = (inp.get("type") or ("submit" if tag_name == "button" else "text")).lower()
                     val = inp.get("value") or ""
+
                     if itype == "hidden":
                         form_data[name] = val
                     elif itype == "password":
                         pass_inputs.append(name)
                     elif itype in ("text", ""):
                         text_inputs.append(name)
-                    elif itype in ("submit", "button") and not submit_btn_name:
-                        submit_btn_name = name
-                        submit_btn_val = val
+                    elif itype in ("submit", "button"):
+                        low_id = (name + " " + (inp.get("id") or "") + " " + val).lower()
+                        if not submit_btn_name or "login" in low_id or "ورود" in low_id:
+                            submit_btn_name = name
+                            submit_btn_val = val
                     elif itype == "image" and not submit_btn_name:
                         submit_btn_name = f"{name}.x"
                         form_data[f"{name}.x"] = "15"
                         form_data[f"{name}.y"] = "15"
 
-                if text_inputs:
+                for tname in text_inputs:
+                    if "user" in tname.lower() or "txt" in tname.lower() or "ctl" in tname.lower() or len(text_inputs) == 1:
+                        form_data[tname] = PACS_USERNAME
+                if text_inputs and not any(k in form_data for k in text_inputs):
                     form_data[text_inputs[0]] = PACS_USERNAME
-                if pass_inputs:
-                    form_data[pass_inputs[0]] = PACS_PASSWORD
+
+                for pname in pass_inputs:
+                    form_data[pname] = PACS_PASSWORD
+
                 if submit_btn_name and not submit_btn_name.endswith(".x"):
                     form_data[submit_btn_name] = submit_btn_val
 
-                post_resp = s.post(login_url, data=form_data, timeout=15, allow_redirects=True)
-                if "bSearch_imgMain" in post_resp.text or "gMain" in post_resp.text:
-                    return post_resp.text, base_path
+                form_data.setdefault("__EVENTTARGET", "")
+                form_data.setdefault("__EVENTARGUMENT", "")
 
-                resp2 = s.get(default_url, timeout=12, allow_redirects=True)
-                if "bSearch_imgMain" in resp2.text or "gMain" in resp2.text:
-                    return resp2.text, base_path
+                headers = {"Referer": lresp.url, "Origin": hosp["origin"]}
+                post_resp = s.post(post_target_url, data=form_data, headers=headers, timeout=15, allow_redirects=True)
+                if self.is_search_page_html(post_resp.text):
+                    return post_resp.text, base_path, None
+
+                resp2 = s.get(default_url, headers={"Referer": post_resp.url}, timeout=12, allow_redirects=True)
+                if self.is_search_page_html(resp2.text):
+                    return resp2.text, base_path, None
+
+                return None, base_path, "لاگین ناموفق (صفحه Login رد نشد یا نام کاربری/رمز doc تغییر کرده است)"
             except Exception as e:
                 logger.error(f"[{hosp_code}] Login failed: {e}")
-
-            return None, base_path
+                return None, base_path, f"خطا در لاگین: {str(e)[:60]}"
 
     def parse_default_table_rows(self, html: str, hosp_code: str, base_path: str) -> List[PatientRow]:
         hosp = HOSPITALS[hosp_code]
         soup = BeautifulSoup(html, "lxml")
         rows: List[PatientRow] = []
 
-        for idx, tr in enumerate(soup.find_all("tr", onclick=re.compile(r"OnSelect", re.I))):
+        # Extract Study Keys (SK) if stored in hfSelectedKeys / table attributes / script arrays
+        candidate_trs = soup.find_all("tr", onclick=re.compile(r"OnSelect", re.I))
+        if not candidate_trs:
+            # Fallback: find rows inside #gMain or any data table with >= 10 columns
+            gmain = soup.find(id=re.compile(r"gMain", re.I))
+            search_root = gmain if gmain else soup
+            for tr in search_root.find_all("tr"):
+                if tr.find("th"):
+                    continue
+                tds = tr.find_all("td")
+                if len(tds) >= 11:
+                    candidate_trs.append(tr)
+
+        for idx, tr in enumerate(candidate_trs):
             tds = tr.find_all("td")
-            if len(tds) < 13:
+            if len(tds) < 11:
                 continue
+
+            # Extract studyKey from tr attributes or onclick if available
+            onclick_str = tr.get("onclick") or ""
+            sk_val = tr.get("key") or tr.get("data-key") or ""
+            if not sk_val:
+                m_sk = re.search(r"OnSelect\s*\(\s*[^,]+,\s*['\"]?(\d+)['\"]?", onclick_str, re.I)
+                if m_sk:
+                    sk_val = m_sk.group(1)
+
+            pid_txt = tds[1].get_text(strip=True) if len(tds) > 1 else ""
+            name_txt = tds[2].get_text(strip=True) if len(tds) > 2 else ""
+            if not pid_txt and not name_txt:
+                continue
+
             rows.append(PatientRow(
                 hosp_code=hosp_code,
                 hosp_name=hosp["name"],
                 origin=hosp["origin"],
                 base_path=base_path,
                 row_index=idx,
-                pid=tds[1].get_text(strip=True),
-                name=tds[2].get_text(strip=True),
-                nid=tds[3].get_text(strip=True),
-                mobile=tds[4].get_text(strip=True),
-                physician=tds[5].get_text(strip=True),
-                sex=tds[6].get_text(strip=True),
-                age=tds[7].get_text(strip=True),
-                modality=tds[8].get_text(strip=True),
-                ser_count=int(re.sub(r"\D", "", tds[9].get_text(strip=True)) or "1"),
-                img_count=int(re.sub(r"\D", "", tds[10].get_text(strip=True)) or "1"),
-                date=tds[11].get_text(strip=True),
-                time=tds[12].get_text(strip=True),
+                study_key=sk_val or pid_txt,
+                pid=pid_txt,
+                name=name_txt,
+                nid=tds[3].get_text(strip=True) if len(tds) > 3 else "",
+                mobile=tds[4].get_text(strip=True) if len(tds) > 4 else "",
+                physician=tds[5].get_text(strip=True) if len(tds) > 5 else "",
+                sex=tds[6].get_text(strip=True) if len(tds) > 6 else "",
+                age=tds[7].get_text(strip=True) if len(tds) > 7 else "",
+                modality=tds[8].get_text(strip=True) if len(tds) > 8 else "",
+                ser_count=int(re.sub(r"\D", "", tds[9].get_text(strip=True)) or "1") if len(tds) > 9 else 1,
+                img_count=int(re.sub(r"\D", "", tds[10].get_text(strip=True)) or "1") if len(tds) > 10 else 1,
+                date=tds[11].get_text(strip=True) if len(tds) > 11 else "",
+                time=tds[12].get_text(strip=True) if len(tds) > 12 else "",
                 report=tds[13].get_text(strip=True) if len(tds) > 13 else "",
                 hospital_col=tds[14].get_text(strip=True) if len(tds) > 14 else ""
             ))
         return rows
+
+    def _post_search_form(
+        self,
+        s: requests.Session,
+        default_url: str,
+        origin: str,
+        base_html: str,
+        name_val: str,
+        pid_val: str,
+        nid_val: str,
+        date_preset: str,
+        start_date: str,
+        end_date: str
+    ) -> Optional[str]:
+        soup = BeautifulSoup(base_html, "lxml")
+        post_data: Dict[str, str] = {}
+
+        # Preserve all hidden fields (__VIEWSTATE, __VIEWSTATEGENERATOR, __EVENTVALIDATION, hfSelectedKeys, etc.)
+        for hidden in soup.find_all("input", {"type": "hidden"}):
+            hname = hidden.get("name")
+            if hname:
+                post_data[hname] = hidden.get("value") or ""
+
+        post_data.setdefault("__EVENTTARGET", "")
+        post_data.setdefault("__EVENTARGUMENT", "")
+        post_data.setdefault("__LASTFOCUS", "")
+
+        # Dynamically verify text input names in case ASP.NET container prefix (e.g. ctl00$ContentPlaceHolder1$ctl09) is present
+        ctl_map = {
+            "ctl09": name_val,
+            "ctl10": nid_val,
+            "ctl14": "",
+            "ctl15": "",
+            "ctl16": pid_val,
+            "ctl20": ""
+        }
+        found_any_ctl = False
+        for inp in soup.find_all("input"):
+            iname = inp.get("name") or ""
+            for short_ctl, val in ctl_map.items():
+                if iname == short_ctl or iname.endswith(f"${short_ctl}") or iname.endswith(f"_{short_ctl}"):
+                    post_data[iname] = val
+                    found_any_ctl = True
+
+        if not found_any_ctl:
+            for short_ctl, val in ctl_map.items():
+                post_data[short_ctl] = val
+
+        # Preserve select dropdowns if present
+        for sel in soup.find_all("select"):
+            sname = sel.get("name")
+            if sname and sname not in post_data:
+                opt = sel.find("option", selected=True)
+                if opt and opt.get("value") is not None:
+                    post_data[sname] = opt.get("value")
+
+        def resolve_btn_prefix(btn_base: str) -> str:
+            for inp in soup.find_all("input", {"type": "image"}):
+                iname = inp.get("name") or ""
+                if btn_base.lower() in iname.lower():
+                    return iname
+            return f"{btn_base}$imgMain"
+
+        if start_date and end_date:
+            post_data["ctl12$cb"] = "on"
+            post_data["ctl12$DT"] = start_date.strip()
+            post_data["ctl18$cb"] = "on"
+            post_data["ctl18$DT"] = end_date.strip()
+            btn_name = resolve_btn_prefix("bSearch")
+        elif date_preset == "TODAY":
+            btn_name = resolve_btn_prefix("bToday")
+        elif date_preset == "YESTERDAY":
+            btn_name = resolve_btn_prefix("bYesterday")
+        elif date_preset == "LASTWEEK":
+            btn_name = resolve_btn_prefix("bLastWeek")
+        else:
+            # Make sure start/end date checkboxes are NOT checked in post_data so ALL dates are searched
+            post_data.pop("ctl12$cb", None)
+            post_data.pop("ctl18$cb", None)
+            btn_name = resolve_btn_prefix("bAllDates")
+
+        post_data[f"{btn_name}.x"] = "12"
+        post_data[f"{btn_name}.y"] = "12"
+
+        headers = {
+            "Referer": default_url,
+            "Origin": origin,
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        resp = s.post(default_url, data=post_data, headers=headers, timeout=18, allow_redirects=True)
+        return resp.text
 
     def search_hospital(
         self,
@@ -820,65 +999,92 @@ class MedalPACSClient:
         date_preset: str = "ALL",
         start_date: str = "",
         end_date: str = ""
-    ) -> List[PatientRow]:
-        html, base_path = self.ensure_logged_in(hosp_code)
-        if not html:
-            return []
-
+    ) -> HospitalSearchResult:
         hosp = HOSPITALS[hosp_code]
+        html, base_path, err_msg = self.ensure_logged_in(hosp_code)
+        if not html:
+            return HospitalSearchResult(
+                hosp_code=hosp_code,
+                hosp_name=hosp["name"],
+                ok=False,
+                status_msg=err_msg or "خطا در اتصال یا ورود به بیمارستان"
+            )
+
         s = self.get_session(hosp_code)
         default_url = f"{hosp['origin']}{base_path}/Default.aspx"
 
         variants_info = generate_search_variants(name_query)
         root_name = variants_info["root_query"]
+        all_variants = variants_info["variants"]
         word_groups = variants_info["word_groups"]
 
-        soup = BeautifulSoup(html, "lxml")
-        post_data: Dict[str, str] = {}
-        for hidden in soup.find_all("input", {"type": "hidden"}):
-            hname = hidden.get("name")
-            if hname:
-                post_data[hname] = hidden.get("value") or ""
-
-        # Exact verified field names from Default.aspx schema:
-        post_data["ctl09"] = root_name
-        post_data["ctl10"] = nid_query.strip()
-        post_data["ctl14"] = ""
-        post_data["ctl15"] = ""
-        post_data["ctl16"] = pid_query.strip()
-        post_data["ctl20"] = ""
-
-        if start_date and end_date:
-            post_data["ctl12$cb"] = "on"
-            post_data["ctl12$DT"] = start_date.strip()
-            post_data["ctl18$cb"] = "on"
-            post_data["ctl18$DT"] = end_date.strip()
-            post_data["bSearch$imgMain.x"] = "12"
-            post_data["bSearch$imgMain.y"] = "12"
-        elif date_preset == "TODAY":
-            post_data["bToday$imgMain.x"] = "12"
-            post_data["bToday$imgMain.y"] = "12"
-        elif date_preset == "YESTERDAY":
-            post_data["bYesterday$imgMain.x"] = "12"
-            post_data["bYesterday$imgMain.y"] = "12"
-        elif date_preset == "LASTWEEK":
-            post_data["bLastWeek$imgMain.x"] = "12"
-            post_data["bLastWeek$imgMain.y"] = "12"
+        # Build candidate queries to try on PACS if the 5-char root returns 0 rows
+        # (e.g. 'FAZEL' misses 'FAZLI', so we also try 'FAZLI' or a 3-letter prefix 'FAZ')
+        candidate_queries: List[str] = []
+        if name_query.strip():
+            for q in [root_name] + all_variants[:3]:
+                if q and q not in candidate_queries:
+                    candidate_queries.append(q)
+            if root_name and len(root_name) >= 4:
+                short3 = root_name[:3]
+                if short3 not in candidate_queries:
+                    candidate_queries.append(short3)
         else:
-            post_data["bAllDates$imgMain.x"] = "12"
-            post_data["bAllDates$imgMain.y"] = "12"
+            candidate_queries = [""]
 
-        try:
-            resp = s.post(default_url, data=post_data, timeout=18, allow_redirects=True)
-            search_html = resp.text
-        except Exception as e:
-            logger.error(f"[{hosp_code}] Search POST failed: {e}")
-            search_html = html
+        collected_rows: Dict[Tuple[str, str, str, str], PatientRow] = {}
+        current_base_html = html
+        raw_total = 0
 
-        rows = self.parse_default_table_rows(search_html, hosp_code, base_path)
+        for q_try in candidate_queries[:3]:
+            try:
+                search_html = self._post_search_form(
+                    s=s,
+                    default_url=default_url,
+                    origin=hosp["origin"],
+                    base_html=current_base_html,
+                    name_val=q_try,
+                    pid_val=pid_query.strip(),
+                    nid_val=nid_query.strip(),
+                    date_preset=date_preset,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                if not search_html:
+                    continue
+                if "__VIEWSTATE" in search_html:
+                    current_base_html = search_html
+
+                rows = self.parse_default_table_rows(search_html, hosp_code, base_path)
+                raw_total = max(raw_total, len(rows))
+                for r in rows:
+                    key = (r.pid, r.name, r.date, r.modality)
+                    if key not in collected_rows:
+                        collected_rows[key] = r
+
+                # Filter & check if we already found matching patients
+                matched_now = 0
+                for r in collected_rows.values():
+                    if word_groups:
+                        sc = score_patient_name_match(r.name, word_groups)
+                        if sc > 0.0 or (q_try and q_try.upper() in r.name.upper()):
+                            matched_now += 1
+                    else:
+                        matched_now += 1
+
+                if matched_now > 0:
+                    break
+            except Exception as e:
+                logger.error(f"[{hosp_code}] Search POST failed for '{q_try}': {e}")
+                return HospitalSearchResult(
+                    hosp_code=hosp_code,
+                    hosp_name=hosp["name"],
+                    ok=False,
+                    status_msg=f"خطا در ارسال فرم جستجو: {str(e)[:50]}"
+                )
 
         filtered: List[PatientRow] = []
-        for r in rows:
+        for r in collected_rows.values():
             if modality_filter and modality_filter != "ALL":
                 if r.modality.upper() != modality_filter.upper():
                     continue
@@ -886,11 +1092,33 @@ class MedalPACSClient:
                 score = score_patient_name_match(r.name, word_groups)
                 if score <= 0.0 and root_name.upper() not in r.name.upper():
                     continue
-                r.match_score = score
+                r.match_score = max(score, 0.1)
             filtered.append(r)
 
         filtered.sort(key=lambda x: x.match_score, reverse=True)
-        return filtered[:20]
+        return HospitalSearchResult(
+            hosp_code=hosp_code,
+            hosp_name=hosp["name"],
+            ok=True,
+            status_msg=f"متصل ({len(filtered)} بیمار منطبق از {raw_total} ردیف)",
+            rows=filtered[:20],
+            raw_row_count=raw_total
+        )
+
+    def resolve_study_key_for_row(self, row: PatientRow) -> str:
+        """Attempt to discover the true internal StudyKey (SK) if different from PID."""
+        if row.study_key and row.study_key != row.pid:
+            return row.study_key
+        s = self.get_session(row.hosp_code)
+        # Test if row.pid works directly with GetImage.aspx
+        test_url = f"{row.origin}{row.base_path}/GetImage.aspx?SK={row.pid}&Ser=1&Img=1&Manipulate=0"
+        try:
+            r = s.get(test_url, timeout=8)
+            if r.status_code == 200 and "<Address>" in r.text:
+                return row.pid
+        except Exception:
+            pass
+        return row.study_key or row.pid
 
     def fetch_slice_bundle(self, hosp_code: str, base_path: str, study_key: str, series_key: str, img_index: int, total_slices: int) -> Optional[dict]:
         hosp = HOSPITALS[hosp_code]
@@ -1030,6 +1258,7 @@ def build_search_glass_keyboard(sess: UserSearchSession) -> dict:
                 {"text": f"🎞 سرعت ویدیو: {sess.fps} FPS", "callback_data": "cycle:fps"}
             ],
             [
+                {"text": "🩺 تست اتصال سرورها", "callback_data": "diag:test"},
                 {"text": "🔄 پاک کردن فیلترها", "callback_data": "reset:filters"},
                 {"text": "🔍 اجرای جستجوی جامع", "callback_data": "exec:search"}
             ]
@@ -1069,6 +1298,49 @@ def tg_api_request(method: str, data: dict = None, files: dict = None) -> dict:
         return {"ok": False}
 
 
+def run_diagnostics_and_send(chat_id: int, sess: UserSearchSession):
+    tg_api_request("sendMessage", {
+        "chat_id": chat_id,
+        "text": "🩺 <b>در حال تست اتصال شبکه و لاگین به هر ۳ بیمارستان...</b>",
+        "parse_mode": "HTML"
+    })
+    lines = ["📊 <b>گزارش وضعیت اتصال به سرورهای PACS:</b>\n"]
+    any_failed_network = False
+    for code, hosp in HOSPITALS.items():
+        t0 = time.time()
+        html, base_path, err = pacs_client.ensure_logged_in(code)
+        dt = time.time() - t0
+        if html:
+            rows = pacs_client.parse_default_table_rows(html, code, base_path)
+            lines.append(
+                f"✅ <b>{hosp['name']}</b>\n"
+                f"   • مسیر: <code>{hosp['origin']}{base_path}</code>\n"
+                f"   • وضعیت: <b>لاگین موفق ({dt:.1f}s)</b> — {len(rows)} ردیف اولیه در صفحه"
+            )
+        else:
+            any_failed_network = True
+            lines.append(
+                f"❌ <b>{hosp['name']}</b>\n"
+                f"   • مسیر: <code>{hosp['origin']}{base_path}</code>\n"
+                f"   • علت خطا: <code>{err or 'نامشخص'}</code>"
+            )
+
+    if any_failed_network:
+        lines.append(
+            "\n⚠️ <b>راهنمای رفع خطای شبکه (مهم):</b>\n"
+            "سرورهای PACS دانشگاه علوم پزشکی سبزوار (<code>*.medsab.ac.ir</code>) روی اینترنت ملی/داخلی ایران هستند و دسترسی آی‌پی‌های خارج از کشور (مثل سرورهای Render و GitHub Actions) را مسدود می‌کنند.\n"
+            "🔹 <b>راه‌حل ۱:</b> یک پروکسی/تانل داخل ایران در متغیر محیطی <code>PACS_PROXY</code> تنظیم کنید.\n"
+            "🔹 <b>راه‌حل ۲:</b> فایل <code>bot.py</code> را روی سیستم یا سرور داخل ایران اجرا کنید."
+        )
+
+    tg_api_request("sendMessage", {
+        "chat_id": chat_id,
+        "text": "\n".join(lines),
+        "parse_mode": "HTML",
+        "reply_markup": build_search_glass_keyboard(sess)
+    })
+
+
 def execute_and_send_search(chat_id: int, sess: UserSearchSession):
     target_hosps = ["HH", "VH", "SBH"] if sess.hospital == "ALL" else [sess.hospital]
     variants_info = generate_search_variants(sess.name_query)
@@ -1099,11 +1371,13 @@ def execute_and_send_search(chat_id: int, sess: UserSearchSession):
     ]
 
     combined: List[PatientRow] = []
+    hosp_A_results: List[HospitalSearchResult] = []
     for fut in as_completed(futures):
         try:
-            res = fut.result()
-            if isinstance(res, list):
-                combined.extend(res)
+            res: HospitalSearchResult = fut.result()
+            hosp_A_results.append(res)
+            if res.ok and res.rows:
+                combined.extend(res.rows)
         except Exception as e:
             logger.error(f"Hospital search thread error: {e}")
 
@@ -1111,9 +1385,34 @@ def execute_and_send_search(chat_id: int, sess: UserSearchSession):
     sess.last_results = combined[:15]
 
     if not sess.last_results:
+        failed_hosps = [r for r in hosp_A_results if not r.ok]
+        status_lines = [
+            f"{'✅' if r.ok else '❌'} <b>{r.hosp_name}:</b> <code>{r.status_msg}</code>"
+            for r in hosp_A_results
+        ]
+        status_block = "\n".join(status_lines)
+
+        if len(failed_hosps) == len(target_hosps):
+            msg_text = (
+                "⚠️ <b>خطا در ارتباط با سرورهای بیمارستان!</b>\n"
+                "ربات نتوانست به سرورهای PACS متصل شود یا لاگین کند:\n\n"
+                f"{status_block}\n\n"
+                "💡 <b>علت اصلی:</b> اگر ربات را روی <b>Render</b> یا <b>GitHub Actions</b> بالا آورده‌اید، آی‌پی این سرورها خارج از ایران است و فایروال دانشگاه علوم پزشکی سبزوار (<code>medsab.ac.ir</code>) اتصال از خارج ایران را مسدود می‌کند.\n"
+                "🔧 <b>راه‌حل:</b>\n"
+                "۱. ربات را روی کامپیوتر خودتان یا یک سرور/VPS داخل ایران اجرا کنید.\n"
+                "۲. یا اگر روی Render/GitHub هستید، متغیر محیطی <code>PACS_PROXY</code> را با آدرس یک پروکسی داخل ایران تنظیم نمایید."
+            )
+        else:
+            msg_text = (
+                "❌ <b>هیچ بیماری با این مشخصات در بیمارستان‌های انتخاب‌شده یافت نشد.</b>\n\n"
+                f"📡 <b>وضعیت سرورها در این جستجو:</b>\n{status_block}\n\n"
+                "می‌توانید فیلتر تاریخ را روی «همه تاریخ‌ها» بگذارید یا بخشی از نام خانوادگی را جستجو کنید."
+            )
+
         tg_api_request("sendMessage", {
             "chat_id": chat_id,
-            "text": "❌ هیچ بیماری با این مشخصات در بیمارستان‌های انتخاب‌شده یافت نشد.\nمی‌توانید فیلتر تاریخ را روی «همه تاریخ‌ها» بگذارید یا بخشی از نام خانوادگی را جستجو کنید.",
+            "text": msg_text,
+            "parse_mode": "HTML",
             "reply_markup": build_search_glass_keyboard(sess)
         })
         return
@@ -1145,7 +1444,7 @@ def process_and_upload_patient_media(chat_id: int, sess: UserSearchSession, row:
         "parse_mode": "HTML"
     })
 
-    study_key = row.pid
+    study_key = pacs_client.resolve_study_key_for_row(row)
     total_slices = max(1, min(row.img_count, 160))
 
     futures = {
@@ -1228,11 +1527,16 @@ def handle_telegram_update(update: dict):
                 "text": (
                     "🎬 <b>ربات جامع مدال پکس (حشمتیه، واسطی، شهید بهشتی)</b>\n\n"
                     "می‌توانید مستقیم <b>نام فارسی بیمار</b> (مثلاً <code>علی فاضلی راد</code> یا <code>راستگو</code>) یا <b>کد پذیرش / کد ملی</b> را تایپ کنید، "
-                    "یا از <b>منوی شیشه‌ای زیر</b> فیلترها را تنظیم نمایید:"
+                    "یا از <b>منوی شیشه‌ای زیر</b> فیلترها را تنظیم نمایید:\n"
+                    "🩺 برای بررسی اتصال سرور به بیمارستان‌ها دستور /diag یا دکمه «تست اتصال سرورها» را بزنید."
                 ),
                 "parse_mode": "HTML",
                 "reply_markup": build_search_glass_keyboard(sess)
             })
+            return
+
+        if text.startswith("/diag") or text.startswith("/status"):
+            run_diagnostics_and_send(chat_id, sess)
             return
 
         if sess.awaiting_field == "name":
@@ -1334,6 +1638,8 @@ def handle_telegram_update(update: dict):
             tg_api_request("editMessageReplyMarkup", {
                 "chat_id": chat_id, "message_id": msg_id, "reply_markup": build_search_glass_keyboard(sess)
             })
+        elif data == "diag:test":
+            run_diagnostics_and_send(chat_id, sess)
         elif data == "exec:search":
             execute_and_send_search(chat_id, sess)
         elif data.startswith("dl:"):
@@ -1346,14 +1652,14 @@ def handle_telegram_update(update: dict):
 
 
 # ==============================================================================
-# 7. RENDER HEALTH SERVER (/ and /health) & SELF KEEP-ALIVE + POLLING LOOP
+# 7. RENDER HEALTH SERVER (/ and /health) & SELF KEEP-ALIVE + SINGLE-INSTANCE POLLING
 # ==============================================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         payload = json.dumps({
             "status": "ok",
             "service": "medal-pacs-telegram-bot",
-            "version": "13.1.0",
+            "version": "13.2.0",
             "hospitals": list(HOSPITALS.keys()),
             "timestamp": time.time()
         }).encode("utf-8")
@@ -1392,15 +1698,30 @@ def telegram_polling_loop():
         while True:
             time.sleep(60)
 
+    # Clear any webhook so getUpdates polling works cleanly
+    tg_api_request("deleteWebhook", {"drop_pending_updates": False})
+
     offset = 0
+    seen_update_ids = set()
     logger.info("Starting Telegram Bot polling loop...")
     while True:
         try:
             res = tg_api_request("getUpdates", {"offset": offset, "timeout": 25})
             if res.get("ok"):
                 for upd in res.get("result", []):
-                    offset = upd["update_id"] + 1
+                    uid = upd["update_id"]
+                    offset = uid + 1
+                    if uid in seen_update_ids:
+                        continue
+                    seen_update_ids.add(uid)
+                    if len(seen_update_ids) > 2000:
+                        seen_update_ids.clear()
                     executor_pool.submit(handle_telegram_update, upd)
+            else:
+                desc = str(res.get("description") or "")
+                if "Conflict" in desc or res.get("error_code") == 409:
+                    logger.warning("Telegram 409 Conflict detected: Another instance of this bot (e.g. Render + GitHub Actions) is running simultaneously!")
+                    time.sleep(5)
         except Exception as e:
             logger.error(f"Telegram polling error: {e}")
             time.sleep(3)
