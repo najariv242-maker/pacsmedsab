@@ -652,8 +652,35 @@ def build_cine_mp4_file(slice_bundles: List[dict], fps: int = 20, play_mode: str
 
 
 # ==============================================================================
-# 5. MULTI-HOSPITAL MEDAL PACS CLIENT (Thread-Safe Requests Sessions + Diagnostics)
+# 5. MULTI-HOSPITAL MEDAL PACS CLIENT + AUTO IRAN PROXY SCANNER (v13.3)
 # ==============================================================================
+SEED_IRAN_PROXIES = [
+    "http://217.11.23.106:8080",
+    "http://31.14.124.45:8080",
+    "http://2.179.95.57:8080",
+    "socks5://87.107.68.231:1081",
+    "http://195.181.40.34:8080",
+    "http://185.118.153.110:8080",
+    "http://77.104.76.230:9001",
+    "http://185.214.39.2:9944",
+    "http://79.127.30.250:8080",
+    "http://80.191.46.62:1090",
+    "http://93.118.120.60:8080",
+    "http://5.63.9.218:10808",
+    "http://81.12.28.35:3128",
+    "http://94.183.6.226:9090",
+    "http://185.109.244.69:8080",
+    "http://178.252.165.122:8080",
+]
+
+IRAN_PROXY_FEED_URLS = [
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=ir",
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/ir/data.txt",
+    "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/main/proxies/countries/ir/data.txt",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=all&timeout=10000&country=IR&ssl=all&anonymity=all"
+]
+
+
 @dataclass
 class PatientRow:
     hosp_code: str
@@ -695,6 +722,7 @@ class MedalPACSClient:
         self.resolved_base_paths: Dict[str, str] = {}
         self.locks: Dict[str, threading.Lock] = {k: threading.Lock() for k in HOSPITALS}
         self.dynamic_proxy: Optional[str] = PACS_PROXY
+        self.auto_proxy_lock = threading.Lock()
 
     def set_proxy(self, proxy_url: Optional[str]):
         clean = (proxy_url or "").strip()
@@ -704,7 +732,6 @@ class MedalPACSClient:
             if "://" not in clean:
                 clean = "http://" + clean
             self.dynamic_proxy = clean
-        # Reset existing sessions so new proxy takes effect immediately
         for k in list(self.sessions.keys()):
             try:
                 self.sessions[k].close()
@@ -712,6 +739,76 @@ class MedalPACSClient:
                 pass
         self.sessions.clear()
         self.resolved_base_paths.clear()
+
+    def fetch_live_iran_proxy_candidates(self) -> List[str]:
+        candidates: List[str] = []
+
+        def add_cand(p: str):
+            p = p.strip()
+            if not p or " " in p or "<" in p:
+                return
+            if "://" not in p:
+                p = "http://" + p
+            if p not in candidates:
+                candidates.append(p)
+
+        for feed_url in IRAN_PROXY_FEED_URLS:
+            try:
+                resp = requests.get(feed_url, timeout=8)
+                if resp.status_code == 200 and resp.text:
+                    for line in resp.text.splitlines():
+                        add_cand(line)
+            except Exception:
+                pass
+
+        for sp in SEED_IRAN_PROXIES:
+            add_cand(sp)
+
+        return candidates[:45]
+
+    @staticmethod
+    def _test_single_proxy_against_pacs(proxy_url: str) -> Tuple[str, bool, float]:
+        t0 = time.time()
+        proxies = {"http": proxy_url, "https": proxy_url}
+        test_urls = [
+            "https://hh-pacs.medsab.ac.ir/Medalwebpro/Login.aspx",
+            "https://sbh-pacs.medsab.ac.ir/MedalWeb/Login.aspx"
+        ]
+        for turl in test_urls:
+            try:
+                r = requests.get(turl, proxies=proxies, verify=False, timeout=7, allow_redirects=True)
+                if r.status_code == 200 and ("__VIEWSTATE" in r.text or "MEDAL" in r.text.upper() or "bSearch" in r.text):
+                    return proxy_url, True, time.time() - t0
+            except Exception:
+                pass
+        return proxy_url, False, 999.0
+
+    def auto_discover_working_iran_proxy(self) -> Tuple[Optional[str], int]:
+        with self.auto_proxy_lock:
+            candidates = self.fetch_live_iran_proxy_candidates()
+            if not candidates:
+                return None, 0
+
+            logger.info(f"Testing {len(candidates)} live Iran proxies against PACS servers...")
+            working: List[Tuple[str, float]] = []
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                futs = [pool.submit(self._test_single_proxy_against_pacs, p) for p in candidates]
+                for fut in as_completed(futs):
+                    try:
+                        p_url, ok, dt = fut.result()
+                        if ok:
+                            working.append((p_url, dt))
+                    except Exception:
+                        pass
+
+            if working:
+                working.sort(key=lambda x: x[1])
+                best_proxy = working[0][0]
+                logger.info(f"Auto-discovered working Iran proxy: {best_proxy} ({working[0][1]:.2f}s)")
+                self.set_proxy(best_proxy)
+                return best_proxy, len(candidates)
+
+            return None, len(candidates)
 
     def get_active_proxies(self) -> Optional[Dict[str, str]]:
         if not self.dynamic_proxy:
@@ -1254,7 +1351,7 @@ def build_search_glass_keyboard(sess: UserSearchSession) -> dict:
 
     hosp_label = "همه (۳ بیمارستان)" if sess.hospital == "ALL" else HOSPITALS[sess.hospital]["name"]
     date_labels = {"ALL": "همه تاریخ‌ها", "TODAY": "امروز", "YESTERDAY": "دیروز", "LASTWEEK": "هفته اخیر"}
-    proxy_status = "فعال ✅" if pacs_client.dynamic_proxy else "ندارد ⚠️"
+    proxy_status = f"فعال ({pacs_client.dynamic_proxy.split('://')[-1][:18]}) ✅" if pacs_client.dynamic_proxy else "ندارد ⚠️"
 
     return {
         "inline_keyboard": [
@@ -1275,11 +1372,12 @@ def build_search_glass_keyboard(sess: UserSearchSession) -> dict:
                 {"text": f"🎞 سرعت ویدیو: {sess.fps} FPS", "callback_data": "cycle:fps"}
             ],
             [
-                {"text": f"🌐 پروکسی ایران: {proxy_status}", "callback_data": "set:proxy"},
-                {"text": "🩺 تست اتصال سرورها", "callback_data": "diag:test"}
+                {"text": "⚡ یافتن خودکار پروکسی ایران", "callback_data": "auto:proxy"},
+                {"text": f"🌐 پروکسی: {proxy_status}", "callback_data": "set:proxy"}
             ],
             [
-                {"text": "🔄 پاک کردن فیلترها", "callback_data": "reset:filters"},
+                {"text": "🩺 تست اتصال", "callback_data": "diag:test"},
+                {"text": "🔄 پاک کردن", "callback_data": "reset:filters"},
                 {"text": "🔍 اجرای جستجوی جامع", "callback_data": "exec:search"}
             ]
         ]
@@ -1318,6 +1416,38 @@ def tg_api_request(method: str, data: dict = None, files: dict = None) -> dict:
         return {"ok": False}
 
 
+def run_auto_proxy_scanner(chat_id: int, sess: UserSearchSession):
+    tg_api_request("sendMessage", {
+        "chat_id": chat_id,
+        "text": "⚡ <b>در حال دریافت لیست زنده پروکسی‌های ایران و تست همزمان روی سرور بیمارستان...</b>\n(حدود ۱۰ ثانیه صبر کنید)",
+        "parse_mode": "HTML"
+    })
+    best_p, total_tested = pacs_client.auto_discover_working_iran_proxy()
+    if best_p:
+        tg_api_request("sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                f"✅ <b>پروکسی فعال ایران پیدا و وصل شد!</b>\n"
+                f"🌐 آدرس: <code>{best_p}</code> (از بین {total_tested} پروکسی تست‌شده)\n"
+                "حالا می‌توانید نام بیمار را جستجو کنید."
+            ),
+            "parse_mode": "HTML",
+            "reply_markup": build_search_glass_keyboard(sess)
+        })
+    else:
+        seed_list = "\n".join(f"• <code>{p}</code>" for p in SEED_IRAN_PROXIES[:8])
+        tg_api_request("sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                f"⚠️ از بین {total_tested} پروکسی عمومی رایگان ایران، هیچ‌کدام در این لحظه سایت بیمارستان را باز نکردند (پروکسی‌های عمومی رایگان شلوغ یا موقت هستند).\n\n"
+                f"📋 <b>لیست پروکسی‌های ایران برای تست دستی:</b>\n{seed_list}\n\n"
+                "💡 <b>بهترین راه‌حل دائمی بدون نیاز به پروکسی:</b> چون خودتان در ایران هستید، فایل <code>run_local_windows.bat</code> را روی ویندوز خودتان اجرا کنید تا با اینترنت ایرانِ خودتان مستقیم به هر ۳ بیمارستان وصل شود!"
+            ),
+            "parse_mode": "HTML",
+            "reply_markup": build_search_glass_keyboard(sess)
+        })
+
+
 def run_diagnostics_and_send(chat_id: int, sess: UserSearchSession):
     proxy_label = f"<code>{pacs_client.dynamic_proxy}</code>" if pacs_client.dynamic_proxy else "<code>تنظیم نشده (اتصال مستقیم از سرور گیت‌هاب)</code>"
     tg_api_request("sendMessage", {
@@ -1325,7 +1455,7 @@ def run_diagnostics_and_send(chat_id: int, sess: UserSearchSession):
         "text": f"🩺 <b>در حال تست اتصال شبکه و لاگین به هر ۳ بیمارستان...</b>\n🌐 پروکسی فعلی: {proxy_label}",
         "parse_mode": "HTML"
     })
-    lines = ["📊 <b>گزارش وضعیت اتصال به سرورهای PACS (نسخه v13.2):</b>\n"]
+    lines = ["📊 <b>گزارش وضعیت اتصال به سرورهای PACS (نسخه v13.3):</b>\n"]
     any_failed_network = False
     for code, hosp in HOSPITALS.items():
         t0 = time.time()
@@ -1348,11 +1478,7 @@ def run_diagnostics_and_send(chat_id: int, sess: UserSearchSession):
 
     if any_failed_network:
         lines.append(
-            "\n⚠️ <b>چرا از داخل گیت‌هاب وصل نمی‌شود؟</b>\n"
-            "سرورهای GitHub Actions در آمریکا قرار دارند، اما سایت‌های بیمارستان (<code>*.medsab.ac.ir</code>) فایروال دارند و فقط به **آی‌پی‌های داخل ایران** اجازه باز شدن می‌دهند.\n\n"
-            "💡 <b>راه‌حل فوری:</b>\n"
-            "۱. روی دکمه <b>«🌐 پروکسی ایران»</b> در منوی شیشه‌ای زیر بزنید و یک آدرس پروکسی ایران (HTTP یا SOCKS5) بفرستید.\n"
-            "۲. یا همین فایل <code>bot.py</code> را روی کامپیوتر خودتان (با اینترنت ایران) اجرا کنید تا بدون نیاز به پروکسی به هر ۳ بیمارستان وصل شود."
+            "\n💡 <b>راه‌حل فوری:</b> روی دکمه <b>«⚡ یافتن خودکار پروکسی ایران»</b> در منوی شیشه‌ای زیر بزنید تا ربات خودش لیست پروکسی‌های رایگان ایران را اسکن و وصل کند."
         )
 
     tg_api_request("sendMessage", {
@@ -1371,7 +1497,7 @@ def execute_and_send_search(chat_id: int, sess: UserSearchSession):
     tg_api_request("sendMessage", {
         "chat_id": chat_id,
         "text": (
-            f"⏳ <b>در حال جستجوی همزمان در {len(target_hosps)} بیمارستان (v13.2)...</b>\n"
+            f"⏳ <b>در حال جستجوی همزمان در {len(target_hosps)} بیمارستان (v13.3)...</b>\n"
             f"👤 نام: <code>{sess.name_query or 'همه'}</code>\n"
             f"🔤 معادل‌های فینگلیش: <code>{variants_str}</code>\n"
             f"🔢 PID: <code>{sess.pid_query or '—'}</code> | 🪪 کد ملی: <code>{sess.nid_query or '—'}</code>"
@@ -1379,29 +1505,43 @@ def execute_and_send_search(chat_id: int, sess: UserSearchSession):
         "parse_mode": "HTML"
     })
 
-    futures = [
-        executor_pool.submit(
-            pacs_client.search_hospital,
-            h_code,
-            sess.name_query,
-            sess.pid_query,
-            sess.nid_query,
-            sess.modality,
-            sess.date_preset
-        )
-        for h_code in target_hosps
-    ]
+    def run_parallel_hosp_search() -> Tuple[List[PatientRow], List[HospitalSearchResult]]:
+        futures = [
+            executor_pool.submit(
+                pacs_client.search_hospital,
+                h_code,
+                sess.name_query,
+                sess.pid_query,
+                sess.nid_query,
+                sess.modality,
+                sess.date_preset
+            )
+            for h_code in target_hosps
+        ]
+        comb: List[PatientRow] = []
+        h_res: List[HospitalSearchResult] = []
+        for fut in as_completed(futures):
+            try:
+                res: HospitalSearchResult = fut.result()
+                h_res.append(res)
+                if res.ok and res.rows:
+                    comb.extend(res.rows)
+            except Exception as e:
+                logger.error(f"Hospital search thread error: {e}")
+        return comb, h_res
 
-    combined: List[PatientRow] = []
-    hosp_results: List[HospitalSearchResult] = []
-    for fut in as_completed(futures):
-        try:
-            res: HospitalSearchResult = fut.result()
-            hosp_results.append(res)
-            if res.ok and res.rows:
-                combined.extend(res.rows)
-        except Exception as e:
-            logger.error(f"Hospital search thread error: {e}")
+    combined, hosp_results = run_parallel_hosp_search()
+
+    # If all hospitals failed due to network block on GitHub, auto-scan Iran proxies and retry once!
+    if not combined and all(not r.ok for r in hosp_results):
+        tg_api_request("sendMessage", {
+            "chat_id": chat_id,
+            "text": "⚡ <b>اتصال مستقیم از گیت‌هاب مسدود بود؛ در حال اسکن خودکار پروکسی‌های رایگان ایران و تلاش مجدد...</b>",
+            "parse_mode": "HTML"
+        })
+        best_p, _ = pacs_client.auto_discover_working_iran_proxy()
+        if best_p:
+            combined, hosp_results = run_parallel_hosp_search()
 
     combined.sort(key=lambda x: x.match_score, reverse=True)
     sess.last_results = combined[:15]
@@ -1416,13 +1556,9 @@ def execute_and_send_search(chat_id: int, sess: UserSearchSession):
 
         if len(failed_hosps) == len(target_hosps):
             msg_text = (
-                "⚠️ <b>خطا در ارتباط شبکه با سرورهای بیمارستان! (v13.2)</b>\n"
-                "ربات از روی سرور گیت‌هاب نتوانست به سایت بیمارستان‌ها وصل شود:\n\n"
+                "⚠️ <b>خطا در ارتباط شبکه با سرورهای بیمارستان! (v13.3)</b>\n\n"
                 f"{status_block}\n\n"
-                "💡 <b>علت دقیق:</b> سرورهای گیت‌هاب در خارج از ایران هستند و فایروال دانشگاه علوم پزشکی سبزوار (<code>medsab.ac.ir</code>) اجازه باز شدن سایت بیمارستان را به آی‌پی خارج نمی‌دهد.\n\n"
-                "🔧 <b>۲ راه حل ساده:</b>\n"
-                "۱. دکمه <b>«🌐 پروکسی ایران»</b> را در منوی زیر بزنید و یک پروکسی ایران (`http://ip:port` یا `socks5://ip:port`) وارد کنید.\n"
-                "۲. یا فایل `bot.py` را روی ویندوز/سیستم خودتان در ایران اجرا کنید تا مستقیم و بدون پروکسی کار کند."
+                "🔧 <b>راه‌حل:</b> دکمه <b>«⚡ یافتن خودکار پروکسی ایران»</b> یا <b>«🌐 پروکسی»</b> را بزنید، یا اسکریپت را روی سیستم خودتان در ایران اجرا کنید."
             )
         else:
             msg_text = (
@@ -1547,10 +1683,10 @@ def handle_telegram_update(update: dict):
             tg_api_request("sendMessage", {
                 "chat_id": chat_id,
                 "text": (
-                    "🎬 <b>ربات جامع مدال پکس — نسخه دیباگ‌شده v13.2</b>\n"
+                    "🎬 <b>ربات جامع مدال پکس — نسخه دیباگ‌شده v13.3 (مجهز به پروکسی‌یاب خودکار ایران)</b>\n"
                     "پوشش: حشمتیه (HH)، واسطی (VH)، شهید بهشتی (SBH)\n\n"
-                    "• مستقیم <b>نام فارسی بیمار</b> (مثلاً <code>فاضلی</code> یا <code>راستگو</code>) یا <b>کد پذیرش / کد ملی</b> را بفرستید.\n"
-                    "• برای بررسی ارتباط با سرور بیمارستان‌ها روی دکمه <b>«🩺 تست اتصال سرورها»</b> بزنید."
+                    "• روی دکمه <b>«⚡ یافتن خودکار پروکسی ایران»</b> بزنید تا ربات خودش پروکسی ایران پیدا کند.\n"
+                    "• یا مستقیم <b>نام فارسی بیمار</b> (مثلاً <code>فاضلی</code> یا <code>راستگو</code>) را بفرستید."
                 ),
                 "parse_mode": "HTML",
                 "reply_markup": build_search_glass_keyboard(sess)
@@ -1559,6 +1695,10 @@ def handle_telegram_update(update: dict):
 
         if text.startswith("/diag") or text.startswith("/status"):
             run_diagnostics_and_send(chat_id, sess)
+            return
+
+        if text.startswith("/autoproxy"):
+            run_auto_proxy_scanner(chat_id, sess)
             return
 
         if text.startswith("/proxy"):
@@ -1605,7 +1745,7 @@ def handle_telegram_update(update: dict):
 
         tg_api_request("sendMessage", {
             "chat_id": chat_id,
-            "text": "✅ فیلترهای جستجو بروزرسانی شد (v13.2):",
+            "text": "✅ فیلترهای جستجو بروزرسانی شد (v13.3):",
             "reply_markup": build_search_glass_keyboard(sess)
         })
         execute_and_send_search(chat_id, sess)
@@ -1641,18 +1781,19 @@ def handle_telegram_update(update: dict):
                 "text": "🪪 لطفاً <b>کد ملی (NID)</b> بیمار را ارسال کنید:",
                 "parse_mode": "HTML"
             })
+        elif data == "auto:proxy":
+            run_auto_proxy_scanner(chat_id, sess)
         elif data == "set:proxy":
             sess.awaiting_field = "proxy"
             cur_p = pacs_client.dynamic_proxy or "تنظیم نشده"
+            seed_str = "\n".join(f"• <code>{p}</code>" for p in SEED_IRAN_PROXIES[:6])
             tg_api_request("sendMessage", {
                 "chat_id": chat_id,
                 "text": (
                     f"🌐 <b>تنظیم پروکسی ایران برای دسترسی از گیت‌هاب به بیمارستان‌ها</b>\n"
                     f"پروکسی فعلی: <code>{cur_p}</code>\n\n"
-                    "لطفاً آدرس پروکسی ایران (HTTP یا SOCKS5) را به یکی از فرمت‌های زیر ارسال کنید:\n"
-                    "• <code>http://ip:port</code>\n"
-                    "• <code>http://user:pass@ip:port</code>\n"
-                    "• <code>socks5://user:pass@ip:port</code>\n\n"
+                    f"چند نمونه پروکسی ایران (روی هر کدام بزنید کپی می‌شود و همینجا بفرستید):\n{seed_str}\n\n"
+                    "یا روی دکمه <b>«⚡ یافتن خودکار پروکسی ایران»</b> در منو بزنید تا ربات خودش تست کند.\n"
                     "برای حذف پروکسی کلمه <code>off</code> را بفرستید."
                 ),
                 "parse_mode": "HTML"
@@ -1720,7 +1861,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         payload = json.dumps({
             "status": "ok",
             "service": "medal-pacs-telegram-bot",
-            "version": "13.2.0",
+            "version": "13.3.0",
             "hospitals": list(HOSPITALS.keys()),
             "timestamp": time.time()
         }).encode("utf-8")
@@ -1759,11 +1900,15 @@ def telegram_polling_loop():
         while True:
             time.sleep(60)
 
+    # Automatically scan for a working Iran proxy on startup if none was provided!
+    if not pacs_client.dynamic_proxy:
+        threading.Thread(target=pacs_client.auto_discover_working_iran_proxy, daemon=True).start()
+
     tg_api_request("deleteWebhook", {"drop_pending_updates": False})
 
     offset = 0
     seen_update_ids = set()
-    logger.info("Starting Telegram Bot polling loop (v13.2)...")
+    logger.info("Starting Telegram Bot polling loop (v13.3)...")
     while True:
         try:
             res = tg_api_request("getUpdates", {"offset": offset, "timeout": 25})
