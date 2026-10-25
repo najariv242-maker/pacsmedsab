@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Medal PACS Multi-Hospital Cine Video, DICOM & Smart Search v13.1
 // @namespace    local.pacs.ai
-// @version      13.1.0
+// @version      14.0.0
 // @description  Debugged Stage 1+2: Fixed Auto-Login (doc/doc), Exact Dojo Search Binding (ctl09/ctl10/ctl16/bAllDates), Accurate Persian-to-Finglish Engine, Cross-Hospital Live Search + Untouched v12 Cine Video/DICOM/JPEG Engine
 // @match        *://hh-pacs.medsab.ac.ir/*
 // @match        *://vh-pacs.medsab.ac.ir/*
@@ -144,24 +144,74 @@
     }
 
     // =========================================================================
-    // MODULE A: Fixed Auto-Login (doc/doc) & Direct Telegram Deep-Link Handler
+    // MODULE A: Fixed Auto-Login (doc/doc) & Persistent Telegram Deep-Link Memory (v14.0)
     // =========================================================================
+    function setPersistentPending(key, val) {
+        if (!val) return;
+        try {
+            sessionStorage.setItem(key, val);
+            localStorage.setItem(key, val);
+            localStorage.setItem(key + "_ts", String(Date.now()));
+        } catch (e) {}
+    }
+
+    function getPersistentPending(key, maxAgeMs = 300000) {
+        try {
+            const sVal = sessionStorage.getItem(key);
+            if (sVal) return sVal;
+            const lVal = localStorage.getItem(key);
+            const ts = parseInt(localStorage.getItem(key + "_ts") || "0", 10);
+            if (lVal && (Date.now() - ts < maxAgeMs)) {
+                return lVal;
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function clearPersistentPending(key) {
+        try {
+            sessionStorage.removeItem(key);
+            localStorage.removeItem(key);
+            localStorage.removeItem(key + "_ts");
+        } catch (e) {}
+    }
+
+    function captureTelegramDeepLinkParams() {
+        // Parse from BOTH query string (?tg_...) AND URL hash (#tg_...) AND ReturnUrl!
+        const combined = new URLSearchParams(window.location.search);
+        if (window.location.hash && window.location.hash.length > 1) {
+            const hashParams = new URLSearchParams(window.location.hash.slice(1));
+            for (const [k, v] of hashParams.entries()) {
+                if (!combined.has(k)) combined.set(k, v);
+            }
+        }
+        const retUrl = combined.get("ReturnUrl") || combined.get("returnurl");
+        if (retUrl && retUrl.includes("?")) {
+            const retQuery = retUrl.split("?")[1];
+            const retParams = new URLSearchParams(retQuery);
+            for (const [k, v] of retParams.entries()) {
+                if (!combined.has(k)) combined.set(k, v);
+            }
+        }
+
+        const tgSk = combined.get("tg_sk");
+        if (tgSk) setPersistentPending("pacs_v13_pending_sk", tgSk);
+
+        const tgPid = combined.get("tg_pid");
+        if (tgPid) setPersistentPending("pacs_v13_pending_pid", tgPid);
+
+        const tgName = combined.get("tg_name");
+        if (tgName) setPersistentPending("pacs_v13_pending_name", tgName);
+
+        const tgAutoView = combined.get("tg_autoview");
+        if (tgAutoView) setPersistentPending("pacs_v13_pending_autoview", tgAutoView);
+
+        const tgAutoDl = combined.get("tg_autodl");
+        if (tgAutoDl) setPersistentPending("pacs_v13_pending_autodl", tgAutoDl);
+    }
+
     function checkAndPerformAutoLogin() {
-        const urlParams = new URLSearchParams(window.location.search);
-        const tgSk = urlParams.get("tg_sk");
-        if (tgSk) sessionStorage.setItem("pacs_v13_pending_sk", tgSk);
-
-        const tgPid = urlParams.get("tg_pid");
-        if (tgPid) sessionStorage.setItem("pacs_v13_pending_pid", tgPid);
-
-        const tgName = urlParams.get("tg_name");
-        if (tgName) sessionStorage.setItem("pacs_v13_pending_name", tgName);
-
-        const tgAutoView = urlParams.get("tg_autoview");
-        if (tgAutoView) sessionStorage.setItem("pacs_v13_pending_autoview", tgAutoView);
-
-        const tgAutoDl = urlParams.get("tg_autodl");
-        if (tgAutoDl) sessionStorage.setItem("pacs_v13_pending_autodl", tgAutoDl);
+        captureTelegramDeepLinkParams();
 
         if (isLoginPage) {
             if (!state.autoLoginEnabled) {
@@ -169,7 +219,7 @@
                 return;
             }
             const lastAttempt = parseInt(sessionStorage.getItem("pacs_v13_login_ts") || "0", 10);
-            if (Date.now() - lastAttempt < 3500) {
+            if (Date.now() - lastAttempt < 4500) {
                 log("در انتظار پاسخ سرور برای لاگین...", "warning");
                 return;
             }
@@ -177,12 +227,11 @@
             let attempts = 0;
             const loginTimer = setInterval(() => {
                 attempts++;
-                if (attempts > 15) {
+                if (attempts > 20) {
                     clearInterval(loginTimer);
                     return;
                 }
 
-                // Strictly exclude our own panel elements!
                 const passInputs = Array.from(document.querySelectorAll('input[type="password"]')).filter(el => !isInsideOurPanel(el));
                 const passInput = passInputs[0];
                 if (!passInput) return;
@@ -192,19 +241,17 @@
                 const userInput = textInputs[0];
                 if (!userInput) return;
 
-                // Find the page's actual LOGIN button (never inside #pacs-v13-panel!)
                 const candidates = Array.from(document.querySelectorAll(
-                    'input[type="submit"], input[type="image"], input[type="button"], button, a'
+                    'input[type="submit"], input[type="image"], input[type="button"], button, a[id*="Login"], a[href*="__doPostBack"]'
                 )).filter(el => !isInsideOurPanel(el));
 
                 const loginBtn = candidates.find(el => {
-                    const txt = ((el.value || el.textContent || el.id || el.name || "") + "").toLowerCase();
+                    const txt = ((el.value || el.textContent || el.id || el.name || el.alt || "") + "").toLowerCase();
                     return txt.includes("login") || txt.includes("ورود") || txt.includes("blogin") || txt.includes("btnlogin") || el.type === "submit";
                 }) || candidates[0];
 
                 clearInterval(loginTimer);
 
-                // Set values natively so ASP.NET / Dojo / browser autofill all register them
                 const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
                 if (nativeInputValueSetter) {
                     nativeInputValueSetter.call(userInput, DEFAULT_CREDENTIALS.username);
@@ -214,13 +261,19 @@
                     passInput.value = DEFAULT_CREDENTIALS.password;
                 }
 
+                userInput.dispatchEvent(new Event("focus", { bubbles: true }));
                 userInput.dispatchEvent(new Event("input", { bubbles: true }));
                 userInput.dispatchEvent(new Event("change", { bubbles: true }));
+                userInput.dispatchEvent(new Event("blur", { bubbles: true }));
+
+                passInput.dispatchEvent(new Event("focus", { bubbles: true }));
                 passInput.dispatchEvent(new Event("input", { bubbles: true }));
                 passInput.dispatchEvent(new Event("change", { bubbles: true }));
+                passInput.dispatchEvent(new Event("blur", { bubbles: true }));
 
                 sessionStorage.setItem("pacs_v13_login_ts", String(Date.now()));
-                log("در حال ورود خودکار با نام کاربری doc ...", "warning");
+                const rememberedName = getPersistentPending("pacs_v13_pending_name") || getPersistentPending("pacs_v13_pending_pid") || "";
+                log(`ورود خودکار (doc/doc)${rememberedName ? " برای جستجوی: " + rememberedName : ""}...`, "warning");
                 setStatus("ورود خودکار (doc/doc)...", "warning");
 
                 setTimeout(() => {
@@ -229,29 +282,22 @@
                     } else if (passInput.form) {
                         passInput.form.submit();
                     }
-                }, 200);
+                }, 350);
             }, 300);
             return;
         }
 
-        // 1. Direct jump to Process.aspx?SK=... if requested by Telegram link
-        const pendingSk = sessionStorage.getItem("pacs_v13_pending_sk");
-        if (pendingSk && !isViewerPage) {
-            sessionStorage.removeItem("pacs_v13_pending_sk");
-            const base = getAppBasePath() || "/Medalwebpro";
-            window.location.href = `${window.location.origin}${base}/Process.aspx?SK=${encodeURIComponent(pendingSk)}`;
-            return;
-        }
-
-        // 2. If Telegram link passed ?tg_pid=... or ?tg_name=... to Default.aspx:
+        // Now on Default.aspx or Process.aspx after login:
         if (isSearchPage) {
-            const pendingPid = sessionStorage.getItem("pacs_v13_pending_pid");
-            const pendingName = sessionStorage.getItem("pacs_v13_pending_name");
-            const pendingAutoView = sessionStorage.getItem("pacs_v13_pending_autoview");
+            const pendingPid = getPersistentPending("pacs_v13_pending_pid");
+            const pendingName = getPersistentPending("pacs_v13_pending_name");
+            const pendingAutoView = getPersistentPending("pacs_v13_pending_autoview");
 
             if (pendingPid || pendingName) {
-                sessionStorage.removeItem("pacs_v13_pending_pid");
-                sessionStorage.removeItem("pacs_v13_pending_name");
+                clearPersistentPending("pacs_v13_pending_pid");
+                clearPersistentPending("pacs_v13_pending_name");
+                clearPersistentPending("pacs_v13_pending_sk");
+
                 setTimeout(() => {
                     if (pendingPid && ui.pidInput) {
                         ui.pidInput.value = pendingPid;
@@ -265,29 +311,28 @@
                     state.searchDatePreset = "ALL";
                     if (ui.datePresetSelect) ui.datePresetSelect.value = "ALL";
                     const { primary } = generateSearchVariants(pendingName || "");
+                    log(`بازیابی خودکار نام بیمار پس از لاگین: "${pendingName || pendingPid}"`, "success");
                     applySearchInCurrentPage(primary);
-                }, 600);
+                }, 650);
                 return;
             }
 
-            // If returning from search postback and tg_autoview=1 was set, auto-open first matching row!
             if (pendingAutoView === "1") {
-                sessionStorage.removeItem("pacs_v13_pending_autoview");
+                clearPersistentPending("pacs_v13_pending_autoview");
                 setTimeout(() => {
                     const rows = getPatientRowsOnDefaultPage();
                     if (rows.length > 0) {
                         log("بیمار یافت شد! در حال باز کردن خودکار ویوئر...", "success");
                         rows[0].tr.click();
-                        setTimeout(() => triggerDefaultPageView(), 300);
+                        setTimeout(() => triggerDefaultPageView(), 350);
                     }
-                }, 700);
+                }, 750);
             }
         }
 
-        // 3. If on Process.aspx and Telegram requested auto-download
-        const pendingAutoDl = sessionStorage.getItem("pacs_v13_pending_autodl");
+        const pendingAutoDl = getPersistentPending("pacs_v13_pending_autodl");
         if (pendingAutoDl && isViewerPage) {
-            sessionStorage.removeItem("pacs_v13_pending_autodl");
+            clearPersistentPending("pacs_v13_pending_autodl");
             if (["VIDEO", "DICOM", "JPEG"].includes(pendingAutoDl.toUpperCase())) {
                 state.outputFormat = pendingAutoDl.toUpperCase();
                 setTimeout(() => {
@@ -2013,7 +2058,7 @@
         panel.innerHTML = `
             <div id="pacs-v12-header" style="cursor:move; font-weight:bold; font-size:13px; color:#38bdf8; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
                 <span>🎬 مدال پکس (${window.location.hostname.split(".")[0].toUpperCase()})</span>
-                <span style="font-size:10px; background:#059669; padding:2px 6px; border-radius:4px; color:#fff; font-weight:normal;">v13.1 Fixed + Cine</span>
+                <span style="font-size:10px; background:#059669; padding:2px 6px; border-radius:4px; color:#fff; font-weight:normal;">v14.0 Final + Auto-Remember</span>
             </div>
 
             <!-- Tab Bar -->
