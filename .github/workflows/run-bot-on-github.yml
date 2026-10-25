@@ -2,8 +2,18 @@ name: Run Medal PACS Bot Directly on GitHub (Free 24/7)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
   schedule:
     - cron: '0 */5 * * *'
+
+# اگر خود فایل ورکفلو تغییر کرد، اجرای قبلی خودکار جایگزین شود
+concurrency:
+  group: medal-pacs-bot-runner
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -11,6 +21,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,10 +38,57 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install beautifulsoup4 lxml opencv-python-headless numpy pillow requests urllib3
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run Telegram Bot
+      - name: Run Telegram Bot (Instant Live Hot-Reload)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           PORT: 7860
+          PYTHONUNBUFFERED: "1"
         run: |
-          timeout 19000s python bot.py || true
+          START_TIME=$(date +%s)
+          MAX_DURATION=19000
+
+          start_bot() {
+            if [ -f requirements.txt ]; then
+              pip install -q -r requirements.txt || true
+            fi
+            echo "🚀 [Hot-Reload] Running bot at commit $(git rev-parse --short HEAD)..."
+            python bot.py &
+            BOT_PID=$!
+          }
+
+          start_bot
+
+          while true; do
+            sleep 3
+
+            # بررسی تایم ۵ ساعت و ۱۵ دقیقه‌ای سیکل گیت‌هاب
+            NOW=$(date +%s)
+            if [ $((NOW - START_TIME)) -ge $MAX_DURATION ]; then
+              echo "⏰ Cycle time reached. Stopping cleanly for next scheduled run..."
+              kill -9 $BOT_PID 2>/dev/null || true
+              break
+            fi
+
+            # بررسی لحظه‌ای هرگونه تغییر در کل مخزن (اضافه، حذف یا ادیت هر فایل)
+            git fetch origin main --quiet 2>/dev/null || continue
+            LOCAL_HASH=$(git rev-parse HEAD)
+            REMOTE_HASH=$(git rev-parse origin/main)
+
+            if [ "$LOCAL_HASH" != "$REMOTE_HASH" ]; then
+              echo "⚡ [Hot-Reload] Change detected ($LOCAL_HASH -> $REMOTE_HASH)! Updating immediately..."
+              kill -9 $BOT_PID 2>/dev/null || true
+              wait $BOT_PID 2>/dev/null || true
+              git reset --hard origin/main
+              git clean -fd
+              start_bot
+            fi
+
+            # اگر بات به دلیل خطای کد متوقف شد، سرور زنده می‌ماند و دوباره تلاش می‌کند
+            if ! kill -0 $BOT_PID 2>/dev/null; then
+              echo "⚠️ [Watchdog] bot.py stopped. Restarting in 5 seconds..."
+              sleep 5
+              start_bot
+            fi
+          done
